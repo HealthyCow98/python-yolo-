@@ -7,16 +7,16 @@ import shutil
 from utils_crop import normalize_bbox
 from detect_cv import detect_needles
 from crop import save_crops
-INPUT_DIR = "input"
-OUTPUT_DIR = "output"
-KEEP_DIR = "keepFiles"
+INPUT_DIR = "../input"
+OUTPUT_DIR = "../output"
+KEEP_DIR = "../keepFiles"
 
 os.makedirs(KEEP_DIR, exist_ok=True)
 os.makedirs(INPUT_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 #  YOLO 모델 로드
-model = YOLO("runs/classify/train3/weights/best.pt")
+model = YOLO("../runs/classify/train3/weights/best.pt")
 
 processed_files = set()
 
