@@ -4,138 +4,148 @@ from ultralytics import YOLO
 import cv2
 import json
 import shutil
-from utils_crop import normalize_bbox
-from detect_cv import detect_needles
-from crop import save_crops
+import pymysql
+
 INPUT_DIR = "../input"
 OUTPUT_DIR = "../output"
 KEEP_DIR = "../keepFiles"
+AMB_DIR = "../ambiguous"
 
-os.makedirs(KEEP_DIR, exist_ok=True)
 os.makedirs(INPUT_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+os.makedirs(KEEP_DIR, exist_ok=True)
+os.makedirs(AMB_DIR, exist_ok=True)
 
-#  YOLO 모델 로드
-model = YOLO("../runs/classify/train3/weights/best.pt")
+# YOLO 모델 로드
+model = YOLO("../models/needle_detect_v1.pt")
+cls_model = YOLO("../runs/classify/train7/weights/best.pt")
 
 processed_files = set()
 
+# DB 연결
+conn = pymysql.connect(
+    host="localhost",
+    user="root",
+    password="1234",
+    database="inference_results",
+    charset="utf8mb4"
+)
+cursor = conn.cursor()
 
-#  YOLO 예측 함수
-#     # 26.03.20 변경 - 불량 검출이 너무 안되서 추가
 
-# def predict_crop(crop):
-#     result = model(crop)[0]
-#     cls = int(result.probs.top1)         # 0: normal, 1: defect
-#     conf = float(result.probs.top1conf)  # 확률
-# 
-#     if cls == 0 and conf < 0.8:  # normal인데 확신 낮으면
-#         cls = 1  # 불량으로 간주
-#         
-#     return cls, conf
-
-def predict_crop(crop):
-    result = model(crop)[0]
-    probs = result.probs.data.tolist()
-
-    normal_prob = probs[0]
-    defect_prob = probs[1]
-
-    #  defect 확률 기준으로 판단
-    if defect_prob > 0.2:
-        cls = 1
-        conf = defect_prob
-    else:
-        cls = 0
-        conf = normal_prob
-
+def classify_crop(crop):
+    result = cls_model(crop)[0]
+    cls = int(result.probs.top1)
+    conf = float(result.probs.top1conf)
     return cls, conf
+
 
 def process_image(file_path):
     print(f"처리중: {file_path}")
-
-    needles, image = detect_needles(file_path)
-
-## crop 생성
-    base = os.path.basename(file_path)
-    name, _ = os.path.splitext(base)
-
-    save_crops(image, needles, name)
+    image = cv2.imread(file_path)
 
     if image is None:
         print("이미지 로드 실패")
         return
 
-    result_list = []
-    defect_count = 0
-
-    for n in needles:
-        x, y, w, h = n["x"], n["y"], n["w"], n["h"]
-
-        #1 crop = image[y:y+h, x:x+w]
-        #2 crop = image[y:int(y + h * 0.7), x:x + w]
-        #3
-        img_h, img_w = image.shape[:2]
-
-        x1, y1, x2, y2 = normalize_bbox(x, y, w, h, img_w, img_h)
-
-        crop = image[y1:y2, x1:x2]
-        # crop 파일 ( 학습시킨 파일 그대로 읽기 위해 주석처리하였음 ) 흑백 보정 및 히스토그램 보정
-        # crop = cv2.resize(crop, (224, 224))
-        # crop = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-        # crop = cv2.equalizeHist(crop)
-
-        #  안전장치 (이거 중요)
-        if crop is None or crop.size == 0:
-            continue
-
-        pred, conf = predict_crop(crop)
-
-        label = "normal"
-        color = (0, 255, 0)
-
-        #  불량 판단 기준
-        if pred == 1 and conf > 0.7:
-            label = "defect"
-            color = (0, 0, 255)
-            defect_count += 1
-
-        # bbox + 라벨 표시
-        #cv2.rectangle(image, (x, y), (x+w, y+h), color, 2)
-        cv2.rectangle(image, (x1, y1), (x2, y2), color, 2)
-        cv2.putText(
-            image,
-            f"{label}:{conf:.2f}",
-            (x1, y1-10),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            color,
-            2
-        )
-
-        result_list.append({
-            "bbox": [x1, y1, x2, y2],
-            "class": label,
-            "confidence": conf
-        })
-
-    #  JSON 저장
     base = os.path.basename(file_path)
     name, _ = os.path.splitext(base)
 
-    with open(f"{OUTPUT_DIR}/{name}.json", "w") as f:
-        json.dump(result_list, f, indent=2)
+    results = model(image, conf=0.5, iou=0.3)[0]
+    boxes = sorted(results.boxes, key=lambda b: b.xyxy[0][0])
 
-    #  결과 이미지 저장
+    result_list = []
+    defect_found = False
+
+    for box in boxes:
+        x1, y1, x2, y2 = map(int, box.xyxy[0])
+        conf = float(box.conf[0])
+
+        w = x2 - x1
+        h = y2 - y1
+
+        if w < 15 or h < 15:
+            continue
+
+        crop = image[y1:y2, x1:x2]
+
+        cls, cls_conf = classify_crop(crop)
+
+        if cls_conf < 0.7:
+            cv2.imwrite(f"{AMB_DIR}/{name}_{len(result_list)}.jpg", crop)
+
+        label_name = cls_model.names[cls]
+
+        if label_name == "defect":
+            label = "defect"
+            color = (0, 0, 255)
+            defect_found = True
+        else:
+            label = "normal"
+            color = (0, 255, 0)
+
+        cv2.rectangle(image, (x1, y1), (x2, y2), color, 2)
+
+        result_list.append({
+            "bbox": [x1, y1, x2, y2],
+            "confidence": conf,
+            "class": label,
+            "class_conf": cls_conf
+        })
+
+    final_result = "NG" if defect_found else "OK"
+
+    if len(result_list) == 0:
+        final_result = "NG"
+
+    # DB 저장 (여기가 핵심)
+    for idx, n in enumerate(result_list):
+        x1, y1, x2, y2 = n["bbox"]
+
+        cursor.execute("""
+            INSERT INTO inference_results
+            (file_name, work_num, infr_dy, batch_index,
+             model_type, class_name, probability,
+             x, y, width, height)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """, (
+            name,
+            name,  # work_num 없으면 일단 name 넣어
+            time.strftime("%Y%m%d"),
+            idx,
+            "needle_cls",
+            n["class"],
+            n["class_conf"],
+            x1,
+            y1,
+            x2 - x1,
+            y2 - y1
+        ))
+
+    conn.commit()
+
+    # 결과 텍스트
+    cv2.putText(
+        image,
+        f"RESULT: {final_result}",
+        (30, 50),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        1.2,
+        (0, 0, 255) if defect_found else (0, 255, 0),
+        3
+    )
+
+    # JSON 저장
+    with open(f"{OUTPUT_DIR}/{name}.json", "w") as f:
+        json.dump({
+            "result": final_result,
+            "needle_count": len(result_list),
+            "needles": result_list
+        }, f, indent=2)
+
     cv2.imwrite(f"{OUTPUT_DIR}/{name}_result.jpg", image)
 
-    print(f"바늘 개수: {len(needles)}")
-
-    #  최종 판정
-    if defect_count > 0:
-        print(f" 불량 (불량 바늘 {defect_count}개)")
-    else:
-        print(" 정상")
+    print(f"검출 개수: {len(result_list)}")
 
 
 def watch_folder():
@@ -143,7 +153,6 @@ def watch_folder():
 
     while True:
         files = os.listdir(INPUT_DIR)
-        print("현재 파일:", files)
 
         for file in files:
             file_path = os.path.join(INPUT_DIR, file)
